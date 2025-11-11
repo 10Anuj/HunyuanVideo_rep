@@ -956,6 +956,14 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
 
+        # all_k_caches = []   
+        # all_v_caches = []
+        print("Loading recompute schedules...")
+        recompute_schedule_k = torch.load("recompute_schedule_k.pt")
+        recompute_schedule_v = torch.load("recompute_schedule_v.pt")
+        kv_cache = {}
+        print("Schedules loaded. Starting denoising loop...")
+
         # if is_progress_bar:
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -988,9 +996,13 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                 with torch.autocast(
                     device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
                 ):
-                    noise_pred = self.transformer(  # For an input image (129, 192, 336) (1, 256, 256)
+                    output_dict, forward_pass_cache = self.transformer(  # For an input image (129, 192, 336) (1, 256, 256)
                         latent_model_input,  # [2, 16, 33, 24, 42]
                         t_expand,  # [2]
+                        i, # Timestep INDEX for our schedule
+                        recompute_schedule_k,
+                        recompute_schedule_v,
+                        kv_cache,               # Pass the main CPU cache
                         text_states=prompt_embeds,  # [2, 256, 4096]
                         text_mask=prompt_mask,  # [2, 256]
                         text_states_2=prompt_embeds_2,  # [2, 768]
@@ -998,9 +1010,30 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                         freqs_sin=freqs_cis[1],  # [seqlen, head_dim]
                         guidance=guidance_expand,
                         return_dict=True,
-                    )[
-                        "x"
-                    ]
+                    )
+                    
+                    noise_pred = output_dict["x"]
+
+                # 3. UPDATE THE CACHE
+                # The forward_pass_cache contains newly computed tensors already on the CPU.
+                # We update our main cache with these new values for the next step.
+                # kv_cache.update(forward_pass_cache)
+                for block_key, new_tensors in forward_pass_cache.items():
+                    # If this is the first time we're caching this block, create its dictionary
+                    if block_key not in kv_cache:
+                        kv_cache[block_key] = {}
+                    # Update the block's specific cache with the newly computed tensors
+                    kv_cache[block_key].update(new_tensors)
+
+                    # all_k_caches.append(k_cache)
+                    # for k, v in v_cache.items():
+                    #     all_v_caches.append(v.clone().cpu())
+
+                    # Create a new dictionary where each value is the CPU-copied version of the tensor
+                    # v_cache_cpu = {key: tensor.clone().cpu() for key, tensor in v_cache.items()}
+
+                    # Append the entire new dictionary (with CPU tensors) to your list
+                    # all_v_caches.append(v_cache_cpu)
 
                 # perform guidance
                 if self.do_classifier_free_guidance:
@@ -1043,6 +1076,9 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                     if callback is not None and i % callback_steps == 0:
                         step_idx = i // getattr(self.scheduler, "order", 1)
                         callback(step_idx, t, latents)
+
+            # torch.save(all_k_caches, "all_k_caches.pt")   
+            # torch.save(all_v_caches, "all_v_caches.pt")
 
         if not output_type == "latent":
             expand_temporal_dim = False

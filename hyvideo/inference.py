@@ -200,6 +200,7 @@ class Inference(object):
         if args.use_fp8:
             convert_fp8_linear(model, args.dit_weight, original_dtype=PRECISION_TO_TYPE[args.precision])
         model = model.to(device)
+        # args.pretrained_model_path = "ckpts/hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states_refactored.pt"
         model = Inference.load_state_dict(args, model, pretrained_model_path)
         model.eval()
 

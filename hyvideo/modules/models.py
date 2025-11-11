@@ -55,9 +55,20 @@ class MMDoubleStreamBlock(nn.Module):
             hidden_size, elementwise_affine=False, eps=1e-6, **factory_kwargs
         )
 
-        self.img_attn_qkv = nn.Linear(
-            hidden_size, hidden_size * 3, bias=qkv_bias, **factory_kwargs
+        self.img_attn_q = nn.Linear(
+            hidden_size, hidden_size, bias=qkv_bias, **factory_kwargs
         )
+        self.img_attn_k = nn.Linear(
+            hidden_size, hidden_size, bias=qkv_bias, **factory_kwargs
+        )
+        self.img_attn_v = nn.Linear(
+            hidden_size, hidden_size, bias=qkv_bias, **factory_kwargs
+        )
+
+        # self.img_attn_qkv = nn.Linear(
+        #     hidden_size, hidden_size * 3, bias=qkv_bias, **factory_kwargs
+        # )
+
         qk_norm_layer = get_norm_layer(qk_norm_type)
         self.img_attn_q_norm = (
             qk_norm_layer(head_dim, elementwise_affine=True, eps=1e-6, **factory_kwargs)
@@ -94,9 +105,19 @@ class MMDoubleStreamBlock(nn.Module):
             hidden_size, elementwise_affine=False, eps=1e-6, **factory_kwargs
         )
 
-        self.txt_attn_qkv = nn.Linear(
-            hidden_size, hidden_size * 3, bias=qkv_bias, **factory_kwargs
+        self.txt_attn_q = nn.Linear(
+            hidden_size, hidden_size, bias=qkv_bias, **factory_kwargs
         )
+        self.txt_attn_k = nn.Linear(
+            hidden_size, hidden_size, bias=qkv_bias, **factory_kwargs
+        )
+        self.txt_attn_v = nn.Linear(
+            hidden_size, hidden_size, bias=qkv_bias, **factory_kwargs
+        )
+
+        # self.txt_attn_qkv = nn.Linear(
+        #     hidden_size, hidden_size * 3, bias=qkv_bias, **factory_kwargs
+        # )
         self.txt_attn_q_norm = (
             qk_norm_layer(head_dim, elementwise_affine=True, eps=1e-6, **factory_kwargs)
             if qk_norm
@@ -134,12 +155,17 @@ class MMDoubleStreamBlock(nn.Module):
         img: torch.Tensor,
         txt: torch.Tensor,
         vec: torch.Tensor,
+        recompute_schedule_k: dict,
+        recompute_schedule_v: dict,
+        i: int,
+        cached_kv: dict,
+        block_key: str,
         cu_seqlens_q: Optional[torch.Tensor] = None,
         cu_seqlens_kv: Optional[torch.Tensor] = None,
         max_seqlen_q: Optional[int] = None,
         max_seqlen_kv: Optional[int] = None,
         freqs_cis: tuple = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         (
             img_mod1_shift,
             img_mod1_scale,
@@ -157,18 +183,48 @@ class MMDoubleStreamBlock(nn.Module):
             txt_mod2_gate,
         ) = self.txt_mod(vec).chunk(6, dim=-1)
 
+        # This dictionary will hold any K/V tensors we recompute in this step.
+        newly_computed_cache = {} 
+
         # Prepare image for attention.
         img_modulated = self.img_norm1(img)
         img_modulated = modulate(
             img_modulated, shift=img_mod1_shift, scale=img_mod1_scale
-        )
-        img_qkv = self.img_attn_qkv(img_modulated)
-        img_q, img_k, img_v = rearrange(
-            img_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num
-        )
+        )       
+
+        # img_qkv = self.img_attn_qkv(img_modulated)
+        # img_q, img_k, img_v = rearrange(
+        #     img_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num
+        # )
         # Apply QK-Norm if needed
-        img_q = self.img_attn_q_norm(img_q).to(img_v)
-        img_k = self.img_attn_k_norm(img_k).to(img_v)
+        # img_q = self.img_attn_q_norm(img_q).to(img_v)
+        # img_k = self.img_attn_k_norm(img_k).to(img_v)
+        
+        # Code for kv cache reuse
+        img_q = self.img_attn_q(img_modulated)
+        img_q = rearrange(img_q, "B L (H D) -> B L H D", H=self.heads_num)
+        img_q = self.img_attn_q_norm(img_q)
+
+        # --- K Tensor Logic ---
+        if i in recompute_schedule_k.get(block_key, []):
+            # RECOMPUTE: This is a scheduled recompute step for K
+            img_k = self.img_attn_k(img_modulated)
+            img_k = rearrange(img_k, "B L (H D) -> B L H D", H=self.heads_num)
+            img_k = self.img_attn_k_norm(img_k)
+            newly_computed_cache['k'] = img_k.to('cpu', non_blocking=True) # Offload immediately
+        else:
+            # REUSE: Load the cached K tensor from CPU to GPU
+            img_k = cached_kv[block_key]['k'].to(img_q.device, non_blocking=True)
+
+        # --- V Tensor Logic ---
+        if i in recompute_schedule_v.get(block_key, []):
+            # RECOMPUTE: This is a scheduled recompute step for V
+            img_v = self.img_attn_v(img_modulated)
+            img_v = rearrange(img_v, "B L (H D) -> B L H D", H=self.heads_num)
+            newly_computed_cache['v'] = img_v.to('cpu', non_blocking=True) # Offload immediately
+        else:
+            # REUSE: Load the cached V tensor from CPU to GPU
+            img_v = cached_kv[block_key]['v'].to(img_q.device, non_blocking=True)
 
         # Apply RoPE if needed.
         if freqs_cis is not None:
@@ -183,10 +239,17 @@ class MMDoubleStreamBlock(nn.Module):
         txt_modulated = modulate(
             txt_modulated, shift=txt_mod1_shift, scale=txt_mod1_scale
         )
-        txt_qkv = self.txt_attn_qkv(txt_modulated)
-        txt_q, txt_k, txt_v = rearrange(
-            txt_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num
-        )
+        # txt_qkv = self.txt_attn_qkv(txt_modulated)
+        # txt_q, txt_k, txt_v = rearrange(
+        #     txt_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num
+        # )
+        txt_q = self.txt_attn_q(txt_modulated)
+        txt_k = self.txt_attn_k(txt_modulated)
+        txt_v = self.txt_attn_v(txt_modulated)
+        # Reshape each tensor individually
+        txt_q = rearrange(txt_q, "B L (H D) -> B L H D", H=self.heads_num)
+        txt_k = rearrange(txt_k, "B L (H D) -> B L H D", H=self.heads_num)
+        txt_v = rearrange(txt_v, "B L (H D) -> B L H D", H=self.heads_num)
         # Apply QK-Norm if needed.
         txt_q = self.txt_attn_q_norm(txt_q).to(txt_v)
         txt_k = self.txt_attn_k_norm(txt_k).to(txt_v)
@@ -249,7 +312,7 @@ class MMDoubleStreamBlock(nn.Module):
             gate=txt_mod2_gate,
         )
 
-        return img, txt
+        return img, txt, newly_computed_cache
 
 
 class MMSingleStreamBlock(nn.Module):
@@ -284,13 +347,18 @@ class MMSingleStreamBlock(nn.Module):
         self.scale = qk_scale or head_dim ** -0.5
 
         # qkv and mlp_in
-        self.linear1 = nn.Linear(
-            hidden_size, hidden_size * 3 + mlp_hidden_dim, **factory_kwargs
-        )
+        # self.linear1 = nn.Linear(
+        #     hidden_size, hidden_size * 3 + mlp_hidden_dim, **factory_kwargs
+        # )
         # proj and mlp_out
         self.linear2 = nn.Linear(
             hidden_size + mlp_hidden_dim, hidden_size, **factory_kwargs
         )
+
+        self.q_proj = nn.Linear(hidden_size, hidden_size, **factory_kwargs)
+        self.k_proj = nn.Linear(hidden_size, hidden_size, **factory_kwargs)
+        self.v_proj = nn.Linear(hidden_size, hidden_size, **factory_kwargs)
+        self.mlp_proj = nn.Linear(hidden_size, mlp_hidden_dim, **factory_kwargs)
 
         qk_norm_layer = get_norm_layer(qk_norm_type)
         self.q_norm = (
@@ -327,24 +395,61 @@ class MMSingleStreamBlock(nn.Module):
         self,
         x: torch.Tensor,
         vec: torch.Tensor,
+        i: int,
+        block_key: str,
+        recompute_schedule_k: dict,
+        recompute_schedule_v: dict,
+        cached_kv: dict,
         txt_len: int,
         cu_seqlens_q: Optional[torch.Tensor] = None,
         cu_seqlens_kv: Optional[torch.Tensor] = None,
         max_seqlen_q: Optional[int] = None,
         max_seqlen_kv: Optional[int] = None,
         freqs_cis: Tuple[torch.Tensor, torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, dict]:
+        
+        # This dictionary will hold any K/V tensors we recompute in this step
+        newly_computed_cache = {}
+
         mod_shift, mod_scale, mod_gate = self.modulation(vec).chunk(3, dim=-1)
         x_mod = modulate(self.pre_norm(x), shift=mod_shift, scale=mod_scale)
-        qkv, mlp = torch.split(
-            self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1
-        )
 
-        q, k, v = rearrange(qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num)
+        # qkv, mlp = torch.split(
+        #     self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1
+        # )
+
+        # q, k, v = rearrange(qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num)
 
         # Apply QK-Norm if needed.
-        q = self.q_norm(q).to(v)
-        k = self.k_norm(k).to(v)
+        # q = self.q_norm(q).to(v)
+        # k = self.k_norm(k).to(v)
+
+        q = self.q_proj(x_mod)
+        mlp = self.mlp_proj(x_mod)
+
+        q = rearrange(q, "B L (H D) -> B L H D", H=self.heads_num)
+        q = self.q_norm(q)
+
+        # --- K Tensor Logic ---
+        if i in recompute_schedule_k.get(block_key, []):
+            # RECOMPUTE
+            k = self.k_proj(x_mod)
+            k = rearrange(k, "B L (H D) -> B L H D", H=self.heads_num)
+            k = self.k_norm(k)
+            newly_computed_cache['k'] = k.to('cpu', non_blocking=True) # Offload
+        else:
+            # REUSE
+            k = cached_kv[block_key]['k'].to(q.device, non_blocking=True) # Load
+
+        # --- V Tensor Logic ---
+        if i in recompute_schedule_v.get(block_key, []):
+            # RECOMPUTE
+            v = self.v_proj(x_mod)
+            v = rearrange(v, "B L (H D) -> B L H D", H=self.heads_num)
+            newly_computed_cache['v'] = v.to('cpu', non_blocking=True) # Offload
+        else:
+            # REUSE
+            v = cached_kv[block_key]['v'].to(q.device, non_blocking=True) # Load
 
         # Apply RoPE if needed.
         if freqs_cis is not None:
@@ -388,9 +493,13 @@ class MMSingleStreamBlock(nn.Module):
             )
         # attention computation end
 
+        # # Offload k and v after they are used
+        # k = k.to('cpu', non_blocking=True)
+        # v = v.to('cpu', non_blocking=True)
+
         # Compute activation in mlp stream, cat again and run second linear layer.
         output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
-        return x + apply_gate(output, gate=mod_gate)
+        return x + apply_gate(output, gate=mod_gate), newly_computed_cache
 
 
 class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
@@ -596,6 +705,10 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         self,
         x: torch.Tensor,
         t: torch.Tensor,  # Should be in range(0, 1000).
+        timestep_index: int,
+        recompute_schedule_k: dict,
+        recompute_schedule_v: dict,
+        cached_kv: dict,
         text_states: torch.Tensor = None,
         text_mask: torch.Tensor = None,  # Now we don't use it.
         text_states_2: Optional[torch.Tensor] = None,  # Text embedding for modulation.
@@ -603,7 +716,10 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         freqs_sin: Optional[torch.Tensor] = None,
         guidance: torch.Tensor = None,  # Guidance for modulation, should be cfg_scale x 1000.
         return_dict: bool = True,
-    ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+    ) -> Tuple[Union[torch.Tensor, Dict[str, torch.Tensor]], Dict[str, Dict[str, torch.Tensor]]]:
+        
+        forward_pass_cache = {}
+
         out = {}
         img = x
         txt = text_states
@@ -651,12 +767,23 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         max_seqlen_kv = max_seqlen_q
 
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
+
+        # 1. Initialize a dictionary to store the K tensors from each block
+        # k_cache = {}    
+        # v_cache = {}
+
         # --------------------- Pass through DiT blocks ------------------------
-        for _, block in enumerate(self.double_blocks):
+        for i, block in enumerate(self.double_blocks):
+            block_key = f'double_{i}'
             double_block_args = [
                 img,
                 txt,
                 vec,
+                recompute_schedule_k,
+                recompute_schedule_v,                
+                timestep_index,                      # Pass current timestep
+                cached_kv,              # Pass the full cache from the previous step
+                block_key,              # Pass the block's unique key
                 cu_seqlens_q,
                 cu_seqlens_kv,
                 max_seqlen_q,
@@ -664,15 +791,28 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                 freqs_cis,
             ]
 
-            img, txt = block(*double_block_args)
+            img, txt, newly_computed_cache = block(*double_block_args)
+            # Store the 'k' tensor with a unique key
+            # k_cache[f'double_{i}'] = k
+            # v_cache[f'double_{i}'] = v
+
+            # Add the newly computed tensors to our collection for this forward pass
+            if newly_computed_cache:
+                forward_pass_cache[block_key] = newly_computed_cache
 
         # Merge txt and img to pass through single stream blocks.
         x = torch.cat((img, txt), 1)
         if len(self.single_blocks) > 0:
-            for _, block in enumerate(self.single_blocks):
+            for i, block in enumerate(self.single_blocks):
+                block_key = f'single_{i}'
                 single_block_args = [
                     x,
                     vec,
+                    timestep_index,                      # Pass current timestep
+                    block_key,              # Pass the block's unique key
+                    recompute_schedule_k,
+                    recompute_schedule_v,
+                    cached_kv,              # Pass the full cache from the previous step
                     txt_seq_len,
                     cu_seqlens_q,
                     cu_seqlens_kv,
@@ -681,7 +821,13 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                     (freqs_cos, freqs_sin),
                 ]
 
-                x = block(*single_block_args)
+                x, newly_computed_cache = block(*single_block_args)
+                # Store the 'k' tensor with a unique key
+                # k_cache[f'single_{i}'] = k
+                # v_cache[f'single_{i}'] = v
+                # Add the newly computed tensors to our collection for this forward pass
+                if newly_computed_cache:
+                    forward_pass_cache[block_key] = newly_computed_cache
 
         img = x[:, :img_seq_len, ...]
 
@@ -691,8 +837,8 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         img = self.unpatchify(img, tt, th, tw)
         if return_dict:
             out["x"] = img
-            return out
-        return img
+            return out, forward_pass_cache
+        return img, forward_pass_cache
 
     def unpatchify(self, x, t, h, w):
         """
